@@ -1,0 +1,863 @@
+# app.R
+# Зависимости R:
+# install.packages(c("shiny","base64enc","shinyjs","reticulate","dplyr","tidyr","stringr","wordcloud","tm","ggplot2"))
+
+library(shiny)
+library(base64enc)
+library(shinyjs)
+library(reticulate)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(wordcloud)
+library(tm)
+library(ggplot2)
+
+
+# -----------------------------
+# Python: убедитесь, что установлены:
+# pip install librosa soundfile numpy scipy transformers whisper torch
+# (если GPU: ставьте torch с подходящим wheel)
+# -----------------------------
+
+# ---------------- Python: единая функция для извлечения множества признаков --------------
+py_run_string("
+import json
+import numpy as np
+import librosa
+import os
+import sys
+
+# Optional: SER
+try:
+    from speechbrain.pretrained import EncoderClassifier
+    ser_model = EncoderClassifier.from_hparams(
+        source='speechbrain/emotion-recognition-wav2vec2-IEMOCAP',
+        savedir='ser_model'
+    )
+except:
+    ser_model = None
+
+# =========================================================
+# ⬇️ НОВАЯ ФУНКЦИЯ: Загрузка аудио с YouTube через yt-dlp
+# =========================================================
+def download_youtube_audio_py(url, output_path_base):
+    try:
+        import yt_dlp
+    except ImportError:
+        print('Ошибка: Библиотека yt-dlp не установлена.', file=sys.stderr)
+        return None
+    
+    # Полный путь для временного файла, который yt-dlp создаст (с расширением .wav)
+    output_full_path = output_path_base + '.wav'
+
+    # yt-dlp options:
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        # Сохранение с указанным именем (yt-dlp добавит .wav в конце)
+        'outtmpl': output_path_base, 
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'wav',
+            'preferredquality': '192',
+        }],
+        'quiet': True,
+        'nocheckcertificate': True
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Запуск загрузки
+            ydl.download([url])
+        
+        # Проверка, что файл создан и возврат полного пути
+        if os.path.exists(output_full_path):
+            return output_full_path
+        else:
+            print(f'Ошибка: Файл {output_full_path} не был создан.', file=sys.stderr)
+            return None
+            
+    except Exception as e:
+        # Более детальный вывод ошибки в консоль R
+        print(f'❌ Ошибка загрузки YouTube: {e}', file=sys.stderr)
+        return None
+
+# =========================================================
+# ⬇️ СУЩЕСТВУЮЩАЯ ФУНКЦИЯ: Извлечение признаков Librosa
+# =========================================================
+def extract_librosa_features_py(file_path, sr_target=16000):
+
+    y, sr = librosa.load(file_path, sr=sr_target)
+
+    # RMS
+    rms = librosa.feature.rms(y=y)[0]
+
+    # Zero crossing
+    zcr = librosa.feature.zero_crossing_rate(y)[0]
+
+    # Spectral centroid
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+
+    # Spectral bandwidth
+    bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
+
+    # Spectral rolloff
+    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.85)[0]
+
+    # Spectral contrast
+    contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+
+    # Chroma
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+
+    # Mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr)
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+
+    # MFCC
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+
+    # Delta MFCC
+    delta_mfcc = librosa.feature.delta(mfcc)
+
+    # Pitch (YIN)
+    f0 = librosa.yin(y, fmin=50, fmax=300, sr=sr)
+    f0 = f0[np.isfinite(f0)]
+    if len(f0) == 0:
+        f0 = np.array([0.0])
+
+    # Harmonic / Percussive
+    y_harm, y_perc = librosa.effects.hpss(y)
+
+    # Onset strength
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+
+    # Tempogram
+    tempogram = librosa.feature.tempogram(onset_envelope=onset_env, sr=sr)
+
+    # SER prediction
+    ser = None
+    if ser_model is not None:
+        try:
+            ser_out = ser_model.classify_file(file_path)
+            ser = {
+                'label': ser_out[3],
+                'scores': ser_out[1].tolist()
+            }
+        except:
+            ser = None
+
+    return {
+        'rms': rms.tolist(),
+        'zcr': zcr.tolist(),
+        'centroid': centroid.tolist(),
+        'bandwidth': bandwidth.tolist(),
+        'rolloff': rolloff.tolist(),
+        'contrast': contrast.tolist(),
+        'chroma': chroma.tolist(),
+        'mel_spec_db': mel_spec_db.tolist(),
+        'mfcc': mfcc.tolist(),
+        'delta_mfcc': delta_mfcc.tolist(),
+        'f0': f0.tolist(),
+        'harm': y_harm.tolist(),
+        'perc': y_perc.tolist(),
+        'onset_env': onset_env.tolist(),
+        'tempogram': tempogram.tolist(),
+        'sr': int(sr),
+        'ser': ser
+    }
+")
+
+# получаем функцию
+extract_librosa_features_py <- py$extract_librosa_features_py
+download_youtube_audio_py <- py$download_youtube_audio_py # <--- ВСТАВИТЬ СЮДА
+
+# ----------------------------- Whisper Init -----------------------------
+whisper <- import("whisper")
+model <- tryCatch({
+  cat("Загрузка модели Whisper: small ...\n")
+  whisper$load_model("small")
+}, error=function(e) stop("❌ Ошибка загрузки модели Whisper: ", e$message))
+
+# ----------------------------- Python Sentiment -----------------------------
+transformers <- import("transformers")
+sentiment_model <- tryCatch({
+  cat("Загрузка модели Sentiment (RU)...\n")
+  transformers$pipeline("sentiment-analysis", model="blanchefort/rubert-base-cased-sentiment")
+}, error = function(e) {
+  stop("❌ Ошибка загрузки русской модели Sentiment: ", e$message)
+})
+
+# ----------------------------- Stopwords -----------------------------
+russian_stopwords_extended <- c(
+  tm::stopwords("russian"),
+  "это","только","можем","может","должны","наш","ключ","лучше",
+  "новых","процесс","весь","даже","очень","также","чтобы","секунд"
+)
+
+# ----------------------------- JS -----------------------------
+audio_recorder_js <- '
+$(document).ready(function() {
+    let mediaRecorder; let audioChunks = []; let stream;
+    const startButton = $("#start_rec"); const stopButton = $("#stop_rec"); const statusDiv = $("#recording_status");
+    startButton.on("click", function() {
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(s => {
+            stream = s; mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" }); audioChunks = [];
+            mediaRecorder.ondataavailable = event => audioChunks.push(event.data);
+            mediaRecorder.onstop = () => {
+                const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+                const reader = new FileReader();
+                reader.onloadend = function() { Shiny.setInputValue("audio_data", reader.result); statusDiv.text("Аудио отправлено. Обрабатывается..."); };
+                reader.readAsDataURL(audioBlob);
+                stream.getTracks().forEach(track => track.stop());
+            };
+            mediaRecorder.start(); statusDiv.text("🔴 Идёт запись..."); startButton.prop("disabled", true); stopButton.prop("disabled", false);
+        }).catch(err => statusDiv.text("❌ Ошибка доступа к микрофону: " + err.name));
+    });
+    stopButton.on("click", function() {
+        if (mediaRecorder && mediaRecorder.state !== "inactive") { mediaRecorder.stop(); statusDiv.text("Остановка записи..."); startButton.prop("disabled", false); stopButton.prop("disabled", true); }
+    });
+    stopButton.prop("disabled", true);
+});
+'
+
+seek_audio_js <- '
+$(document).on("click", ".seekable-word", function(e) {
+    e.preventDefault();
+    const t = $(this).data("seek-time");
+    const p = document.getElementById("audio_player_control");
+    if (p && t !== undefined) { p.currentTime = t; p.play(); }
+});
+'
+
+# ----------------------------- UI -----------------------------
+ui <- fluidPage(
+  useShinyjs(),
+  tags$head(tags$script(HTML(audio_recorder_js)), tags$script(HTML(seek_audio_js))),
+  titlePanel("🎤 Audio2Text: SpeakTrack"),
+  
+  fluidRow(
+    column(4,
+           actionButton("start_rec","Начать запись", icon=icon("microphone")),
+           actionButton("stop_rec","Остановить", icon=icon("stop")),
+           fileInput("upload_audio","Загрузить аудио", accept=c(".wav",".mp3",".m4a",".webm")),
+           hr(), # Новый разделитель
+           textInput("youtube_url", "YouTube URL", value = "", placeholder = "Вставьте ссылку на YouTube"),
+           actionButton("download_youtube","Загрузить с YouTube", icon=icon("cloud-download-alt"))
+    ),
+    column(8, div(id="recording_status","Ожидание начала записи...", style="font-weight:bold;"))
+  ),
+  
+  hr(),
+  
+  sidebarLayout(
+    sidebarPanel(
+      width=6,
+      h3("Распознавание речи"),
+      verbatimTextOutput("transcribed_text"),
+      hr(),
+      h4("Аудио"),
+      uiOutput("audio_player_ui"),
+      hr(),
+      verbatimTextOutput("debug_info")
+    ),
+    mainPanel(
+      width=6,
+      h3("Аналитика и навигация"),
+      tabsetPanel(
+        tabPanel("Навигация", tableOutput("seekable_words_table")),
+        tabPanel("Облако слов", plotOutput("word_cloud_plot", height="350px")),
+        tabPanel("Speech & Sentiment",
+                 h4("Скорость речи и паузы"),
+                 verbatimTextOutput("speech_metrics_text")),
+        tabPanel("Акустика голоса (librosa)",
+                 h4("Акустические сводки"), #new
+                 verbatimTextOutput("acoustic_summary_text"),
+                 hr(),#new
+                 
+                 h4("RMS energy (энергия голоса)"),
+                 plotOutput("rms_plot"),
+                 h4("Zero crossing rate"),
+                 plotOutput("zcr_plot"),
+                 hr(),
+                 h4("Spectral centroid (яркость)"),
+                 plotOutput("centroid_plot"),
+                 h4("Spectral bandwidth"),
+                 plotOutput("bandwidth_plot"),
+                 h4("Spectral contrast"),
+                 plotOutput("contrast_plot"),
+                 h4("Spectral rolloff"),
+                 plotOutput("rolloff_plot"),
+                 h4("Chroma (heatmap)"),
+                 plotOutput("chroma_plot"),
+                 hr(),
+                 h4("MFCC (13 коэффициентов) - mean"),
+                 plotOutput("mfcc_plot"),
+                 h4("Delta MFCC (mean)"),
+                 plotOutput("delta_mfcc_plot"),
+                 hr(),
+                 h4("Pitch (YIN) contour"),
+                 plotOutput("pitch_plot"),
+                 hr(),
+                 h4("Onset strength"),
+                 plotOutput("onset_env_plot"),
+                 h4("Tempogram"),
+                 plotOutput("tempogram_plot"),
+                 h4("Beat times (vertical lines on onset)"),
+                 plotOutput("beat_plot")
+        )
+      )
+    )
+  )
+)
+
+# ----------------------------- Server -----------------------------
+server <- function(input, output, session) {
+  
+  rv_text <- reactiveVal("")
+  rv_words_df <- reactiveVal(NULL)
+  rv_audio_path <- reactiveVal(NULL)
+  rv_librosa_res <- reactiveVal(NULL)
+  
+  output$debug_info <- renderPrint({ cat("Модель Whisper: small\n") })
+  
+  # ----------------------------- Librosa wrapper (R calls Python func) -------------
+  compute_librosa <- reactive({
+    req(rv_audio_path())
+    path <- rv_audio_path()
+    # Вызываем Python функцию, которая возвращает списки
+    L <- tryCatch({
+      py_res <- extract_librosa_features_py(path, 16000L)
+      py_res
+    }, error = function(e) {
+      warning("Ошибка при вызове librosa в Python: ", e$message)
+      return(NULL)
+    })
+    if (is.null(L)) return(NULL)
+    
+    # приведение в удобный R-формат
+    # большинство полей — списки чисел; превращаем в векторы/matrices
+    rms <- tryCatch(unlist(L$rms), error=function(e) numeric(0))
+    zcr <- tryCatch(unlist(L$zcr), error=function(e) numeric(0))
+    frame_energy <- tryCatch(unlist(L$frame_energy), error=function(e) numeric(0))
+    centroid <- tryCatch(unlist(L$centroid), error=function(e) numeric(0))
+    bandwidth <- tryCatch(unlist(L$bandwidth), error=function(e) numeric(0))
+    rolloff <- tryCatch(unlist(L$rolloff), error=function(e) numeric(0))
+    onset_env <- tryCatch(unlist(L$onset_env), error=function(e) numeric(0))
+    f0 <- tryCatch(unlist(L$f0), error=function(e) numeric(0))
+    harm_rms <- tryCatch(unlist(L$harm_rms), error=function(e) numeric(0))
+    perc_rms <- tryCatch(unlist(L$perc_rms), error=function(e) numeric(0))
+    tempo <- tryCatch(L$tempo, error=function(e) NA)
+    beat_times <- tryCatch(unlist(L$beat_times), error=function(e) numeric(0))
+    onset_times <- tryCatch(unlist(L$onset_times), error=function(e) numeric(0))
+    
+    # contrast: list of lists -> matrix (n_bands x frames)
+    contrast <- tryCatch({
+      m <- do.call(rbind, L$contrast)
+      m
+    }, error=function(e) matrix(nrow=0,ncol=0))
+    chroma <- tryCatch({
+      m <- do.call(rbind, L$chroma)
+      m
+    }, error=function(e) matrix(nrow=0,ncol=0))
+    mfcc <- tryCatch({
+      m <- do.call(rbind, L$mfcc)
+      if (nrow(m) == 13) m else t(m)
+    }, error=function(e) matrix(nrow=13,ncol=0))
+    delta_mfcc <- tryCatch({
+      m <- do.call(rbind, L$delta_mfcc)
+      if (nrow(m) == 13) m else t(m)
+    }, error=function(e) matrix(nrow=13,ncol=0))
+    melspec_db <- tryCatch({
+      m <- do.call(rbind, L$melspec_db)
+      m
+    }, error=function(e) matrix(nrow=0,ncol=0))
+    tempogram <- tryCatch({
+      m <- do.call(rbind, L$tempogram)
+      m
+    }, error=function(e) matrix(nrow=0,ncol=0))
+    
+    res <- list(
+      sr = L$sr,
+      rms = rms,
+      zcr = zcr,
+      frame_energy = frame_energy,
+      centroid = centroid,
+      bandwidth = bandwidth,
+      rolloff = rolloff,
+      contrast = contrast,
+      chroma = chroma,
+      mfcc = mfcc,
+      delta_mfcc = delta_mfcc,
+      melspec_db = melspec_db,
+      f0 = f0,
+      harm_rms = harm_rms,
+      perc_rms = perc_rms,
+      onset_env = onset_env,
+      tempogram = tempogram,
+      tempo = tempo,
+      beat_times = beat_times,
+      onset_times = onset_times,#remove comma
+      ser = L$ser
+    )
+    
+    rv_librosa_res(res)
+    res
+  })
+  
+  # ===================
+  acoustic_summary <- reactive({
+    L <- compute_librosa(); req(L)
+    
+    # Pitch
+    f0 <- as.numeric(L$f0)
+    f0 <- f0[f0 > 50 & f0 < 350]
+    
+    mean_f0 <- if(length(f0)>0) round(mean(f0),1) else NA
+    range_f0 <- if(length(f0)>10) round(quantile(f0,0.95)-quantile(f0,0.05),1) else NA
+    
+    # RMS
+    rms <- as.numeric(L$rms)
+    rms_db <- 20 * log10(pmax(rms, 1e-9))
+    mean_rms <- round(mean(rms_db), 1)
+    sd_rms <- round(sd(rms_db), 1)
+    
+    # NEW: Spectral Features (Проверки на длину вектора уже есть - это хорошо)
+    mean_zcr <- if(length(L$zcr)>0) round(mean(L$zcr), 3) else NA
+    mean_centroid <- if(length(L$centroid)>0) round(mean(L$centroid), 1) else NA
+    mean_bandwidth <- if(length(L$bandwidth)>0) round(mean(L$bandwidth), 1) else NA
+    
+    # NEW: Tempo (Критическое изменение!)
+    # Проверяем, что L$tempo существует и является числовым (не NULL, не NA, не матрица)
+    if (!is.null(L$tempo) && is.numeric(L$tempo) && length(L$tempo) == 1 && !is.na(L$tempo)) {
+      mean_tempo <- round(L$tempo, 1)
+    } else {
+      mean_tempo <- NA
+    }
+    
+    list(
+      mean_f0 = mean_f0,
+      range_f0 = range_f0,
+      mean_rms = mean_rms,
+      sd_rms = sd_rms,
+      mean_zcr = mean_zcr,
+      mean_centroid = mean_centroid,
+      mean_bandwidth = mean_bandwidth,
+      mean_tempo = mean_tempo,
+      ser = L$ser
+    )
+  })
+  # ==================
+  
+  # ---------------- Plots for many features ----------------
+  output$rms_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (length(L$rms) == 0) { plot.new(); title("RMS: нет данных"); return() }
+    df <- data.frame(t = seq_along(L$rms), rms = as.numeric(L$rms))
+    ggplot(df, aes(t, rms)) + geom_line() + theme_minimal() + labs(title="RMS Energy", x="Frame", y="Energy")
+  })
+  
+  output$zcr_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (length(L$zcr) == 0) { plot.new(); title("ZCR: нет данных"); return() }
+    df <- data.frame(t = seq_along(L$zcr), zcr = as.numeric(L$zcr))
+    ggplot(df, aes(t, zcr)) + geom_line() + theme_minimal() + labs(title="Zero Crossing Rate", x="Frame", y="ZCR")
+  })
+  
+  output$centroid_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (length(L$centroid) == 0) { plot.new(); title("Centroid: нет данных"); return() }
+    df <- data.frame(t = seq_along(L$centroid), centroid = as.numeric(L$centroid))
+    ggplot(df, aes(t, centroid)) + geom_line() + theme_minimal() + labs(title="Spectral Centroid", x="Frame", y="Hz")
+  })
+  
+  output$bandwidth_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (length(L$bandwidth) == 0) { plot.new(); title("Bandwidth: нет данных"); return() }
+    df <- data.frame(t = seq_along(L$bandwidth), bw = as.numeric(L$bandwidth))
+    ggplot(df, aes(t, bw)) + geom_line() + theme_minimal() + labs(title="Spectral Bandwidth", x="Frame", y="Bandwidth")
+  })
+  
+  output$contrast_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (is.null(L$contrast) || nrow(L$contrast)==0) { plot.new(); title("Contrast: нет данных"); return() }
+    # melt contrast for plotting
+    m <- as.data.frame(t(L$contrast))
+    colnames(m) <- paste0("band", seq_len(ncol(m)))
+    m$frame <- seq_len(nrow(m))
+    df <- tidyr::pivot_longer(m, cols = starts_with("band"), names_to="band", values_to="value")
+    ggplot(df, aes(frame, value, color=band)) + geom_line() + theme_minimal() + labs(title="Spectral Contrast", x="Frame", y="Contrast")
+  })
+  
+  output$rolloff_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (length(L$rolloff) == 0) { plot.new(); title("Rolloff: нет данных"); return() }
+    df <- data.frame(t = seq_along(L$rolloff), rolloff = as.numeric(L$rolloff))
+    ggplot(df, aes(t, rolloff)) + geom_line() + theme_minimal() + labs(title="Spectral Rolloff", x="Frame", y="Hz")
+  })
+  
+  output$chroma_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (is.null(L$chroma) || nrow(L$chroma)==0) { plot.new(); title("Chroma: нет данных"); return() }
+    mat <- L$chroma
+    # heatmap: chroma rows x frames columns
+    image(t(mat[nrow(mat):1, , drop=FALSE]), axes=FALSE)
+    title("Chroma (rows: chroma bins, left->right: time)")
+  })
+  
+  output$mfcc_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (is.null(L$mfcc) || ncol(L$mfcc) == 0) { plot.new(); title("MFCC: нет данных"); return() }
+    mfcc_mean <- apply(L$mfcc, 1, mean, na.rm = TRUE)
+    df <- data.frame(coeff = factor(1:length(mfcc_mean)), value = mfcc_mean)
+    ggplot(df, aes(coeff, value)) + geom_bar(stat="identity", fill="darkgreen") + theme_minimal() + labs(title="MFCC (mean)", x="MFCC #", y="Mean")
+  })
+  
+  output$delta_mfcc_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (is.null(L$delta_mfcc) || ncol(L$delta_mfcc) == 0) { plot.new(); title("Delta MFCC: нет данных"); return() }
+    dm <- apply(L$delta_mfcc, 1, mean, na.rm=TRUE)
+    df <- data.frame(coeff = factor(1:length(dm)), value = dm)
+    ggplot(df, aes(coeff, value)) + geom_bar(stat="identity", fill="orange") + theme_minimal() + labs(title="Delta-MFCC (mean)", x="MFCC #", y="Mean Delta")
+  })
+  
+  
+  output$pitch_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (length(L$f0) == 0) { plot.new(); title("Pitch: нет данных"); return() }
+    df <- data.frame(t = seq_along(L$f0), f0 = as.numeric(L$f0))
+    ggplot(df, aes(t, f0)) + geom_line() + theme_minimal() + labs(title="Pitch (YIN)", x="Frame", y="Hz")
+  })
+  
+  output$onset_env_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (length(L$onset_env) == 0) { plot.new(); title("Onset env: нет данных"); return() }
+    df <- data.frame(t = seq_along(L$onset_env), onset = as.numeric(L$onset_env))
+    ggplot(df, aes(t, onset)) + geom_line() + theme_minimal() + labs(title="Onset Strength", x="Frame", y="Strength")
+  })
+  
+  output$tempogram_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    if (is.null(L$tempogram) || nrow(L$tempogram) == 0) { plot.new(); title("Tempogram: нет данных"); return() }
+    mat <- L$tempogram
+    image(t(mat[nrow(mat):1, , drop=FALSE]), axes=FALSE)
+    title("Tempogram")
+  })
+  
+  output$beat_plot <- renderPlot({
+    L <- compute_librosa(); req(L)
+    # overlay beat times on onset env
+    if (length(L$onset_env) == 0) { plot.new(); title("Beats/Onset: нет данных"); return() }
+    onset_env <- L$onset_env
+    df <- data.frame(t = seq_along(onset_env), onset = as.numeric(onset_env))
+    p <- ggplot(df, aes(t, onset)) + geom_line() + theme_minimal() + labs(title="Onset strength + beat times", x="Frame", y="Onset")
+    # convert beat times to frames approx: beat_time * sr / hop_length
+    if (!is.null(L$beat_times) && length(L$beat_times) > 0 && !is.na(L$sr)) {
+      hop_length <- 512
+      beat_frames <- round(L$beat_times * L$sr / hop_length)
+      for (bf in beat_frames) p <- p + geom_vline(xintercept = bf, color="red", linetype="dashed", alpha=0.6)
+    }
+    print(p)
+  })
+  
+  # ----------------------------- AUDIO PROCESSING (Whisper) -----------------------------
+  process_audio <- function(audio_path){
+    rv_audio_path(audio_path)
+    
+    showNotification("Whisper: Распознавание речи...", duration=NULL, id="wh_notify")
+    
+    total_dur <- as.numeric(system(sprintf('ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"%s\"', audio_path), intern=TRUE))
+    if (is.na(total_dur)) total_dur <- 0
+    n_seg <- ceiling(total_dur / 20)
+    if (n_seg < 1) n_seg <- 1
+    words_all <- list(); full_text <- ""
+    
+    for (i in 0:(n_seg-1)) {
+      seg_file <- tempfile(fileext=".wav")
+      start_time <- i*20
+      system(sprintf('ffmpeg -y -i \"%s\" -ss %f -t 20 \"%s\"', audio_path, start_time, seg_file), ignore.stdout=TRUE, ignore.stderr=TRUE)
+      
+      seg_tr <- tryCatch({ model$transcribe(seg_file, fp16=FALSE, language="ru", word_timestamps=TRUE) }, error=function(e) NULL)
+      if (is.null(seg_tr)) next
+      full_text <- paste(full_text, seg_tr$text)
+      
+      if (!is.null(seg_tr$segments)) {
+        for (s in seg_tr$segments) {
+          if (!is.null(s$words)) {
+            seg_words <- do.call(rbind, lapply(s$words, function(w) {
+              data.frame(word=as.character(w$word),
+                         start=as.numeric(w$start)+start_time,
+                         end=as.numeric(w$end)+start_time,
+                         stringsAsFactors=FALSE)
+            }))
+            words_all[[length(words_all)+1]] <- seg_words
+          } else {
+            # fallback: если нет word-level, разбиваем сегментный текст
+            tokens <- unlist(strsplit(as.character(s$text), '\\\\s+'))
+            tokens <- tokens[tokens!=""]
+            if (length(tokens) > 0) {
+              seg_words <- data.frame(word=tokens,
+                                      start=rep(as.numeric(s$start)+start_time, length(tokens)),
+                                      end=rep(as.numeric(s$end)+start_time, length(tokens)),
+                                      stringsAsFactors=FALSE)
+              words_all[[length(words_all)+1]] <- seg_words
+            }
+          }
+        }
+      }
+    }
+    
+    removeNotification(id="wh_notify")
+    rv_text(full_text)
+    
+    if (length(words_all) == 0) {
+      rv_words_df(data.frame(word=character(0), start=numeric(0), end=numeric(0)))
+      return(invisible(NULL))
+    }
+    
+    words_df <- do.call(rbind, words_all)
+    words_df <- words_df %>%
+      mutate(word_raw=word,
+             word=str_to_lower(word),
+             word=str_trim(word),
+             word=str_replace_all(word,"[^а-яё0-9]","")) %>%
+      filter(word!="",!is.na(start))
+    rv_words_df(words_df)
+  }
+  
+  # ------------------ запись микрофона ------------------
+  observeEvent(input$audio_data,{
+    req(input$audio_data)
+    output$audio_player_ui <- renderUI({ tags$audio(src=input$audio_data, controls=TRUE, id="audio_player_control") })
+    b64 <- gsub("^data:audio/[^;]+;base64,", "", input$audio_data)
+    audio_raw <- base64decode(b64)
+    webm_file <- tempfile(fileext=".webm"); writeBin(audio_raw, webm_file)
+    wav_file <- tempfile(fileext=".wav")
+    system(sprintf('ffmpeg -y -f webm -i \"%s\" -ar 16000 -ac 1 \"%s\"', webm_file, wav_file))
+    process_audio(wav_file)
+    # также запускаем librosa анализ на полном wav
+    try({ compute_librosa() }, silent=TRUE)
+  })
+  
+  # ------------------ загруженный файл ------------------
+  observeEvent(input$upload_audio,{
+    req(input$upload_audio)
+    file_path <- input$upload_audio$datapath
+    
+    mime_type <- switch(tolower(tools::file_ext(input$upload_audio$name)),
+                        "wav"="audio/wav","mp3"="audio/mpeg","m4a"="audio/mp4","webm"="audio/webm","audio/wav")
+    # создаём data URL для проигрывания в браузере
+    audio_dataurl <- base64enc::dataURI(file=file_path, mime=mime_type)
+    
+    output$audio_player_ui <- renderUI({
+      tags$audio(src=audio_dataurl, type=mime_type, controls=TRUE, id="audio_player_control")
+    })
+    
+    process_audio(file_path)
+    # запускаем librosa анализ (полный файл)
+    try({ compute_librosa() }, silent=TRUE)
+  })
+  
+  #YOUTUBE
+  observeEvent(input$download_youtube, {
+    url <- input$youtube_url; req(url)
+    
+    # 1. Индикация и блокировка
+    showNotification("YouTube: Загрузка и конвертация аудио...", duration=NULL, id="yt_notify", type="default")
+    disable("download_youtube")
+    
+    # 2. Выбор пути для сохранения
+    # Создаем временный файл без расширения, yt-dlp добавит .wav
+    temp_wav_path_base <- tempfile(fileext = "") 
+    
+    # 3. Вызов Python-функции
+    # Поскольку yt-dlp добавляет .wav, итоговый путь будет temp_wav_path_base.wav
+    wav_path <- download_youtube_audio_py(url, temp_wav_path_base)
+    
+    removeNotification(id="yt_notify")
+    enable("download_youtube")
+    
+    if (is.null(wav_path) || !file.exists(wav_path)) {
+      showNotification("❌ Ошибка загрузки или конвертации YouTube.", type="error")
+      return(NULL)
+    }
+    
+    # 4. Проигрыватель
+    # Используем созданный WAV-файл для проигрывателя
+    audio_dataurl <- base64enc::dataURI(file=wav_path, mime="audio/wav")
+    output$audio_player_ui <- renderUI({
+      tags$audio(src=audio_dataurl, type="audio/wav", controls=TRUE, id="audio_player_control")
+    })
+    
+    # 5. Обработка аудио
+    process_audio(wav_path)
+    
+    # 6. Librosa анализ
+    try({ compute_librosa() }, silent=TRUE)
+    
+    showNotification(paste("✅ Аудио с YouTube обработано. Длина файла:", round(file.size(wav_path)/1024^2, 2), "МБ"), type="default")
+  })
+  #YOUTUBE
+  
+  # ----------------------------- Навигация по словам -----------------------------
+  word_counts_seekable <- reactive({
+    words_df <- rv_words_df(); req(words_df)
+    df <- words_df %>%
+      filter(!word %in% russian_stopwords_extended) %>%
+      filter(str_detect(word,"^[а-яё]+$")) %>%
+      group_by(word) %>%
+      summarise(Частота=n(), Минимальное_Время=min(start, na.rm=TRUE), .groups="drop") %>%
+      arrange(desc(Частота), Минимальное_Время) %>%
+      head(50) %>%
+      rename(Слово=word)
+    df
+  })
+  
+  output$seekable_words_table <- renderTable({
+    df <- word_counts_seekable(); req(df)
+    fmt_time <- function(sec) sprintf("%02d:%02d", floor(sec/60), round(sec%%60))
+    df$Слово <- sapply(seq_len(nrow(df)), function(i)
+      as.character(tags$a(df$Слово[i], href="#", class="seekable-word",
+                          `data-seek-time`=df$Минимальное_Время[i],
+                          style="color:blue;cursor:pointer;text-decoration:underline;")))
+    df$Время <- fmt_time(df$Минимальное_Время)
+    df %>% select(Слово, Частота, Время)
+  }, sanitize.text.function=function(x)x)
+  
+  # ----------------------------- Облако слов -----------------------------
+  output$word_cloud_plot <- renderPlot({
+    df <- word_counts_seekable(); req(df)
+    words <- df$Слово; freqs <- df$Частота
+    if(length(words)==0) return(NULL)
+    par(mar=c(0,0,0,0))
+    wordcloud(words=words, freq=freqs, min.freq=1, max.words=100, random.order=FALSE)
+  })
+  
+  output$transcribed_text <- renderPrint({ rv_text() })
+  
+  # ----------------------------- WPM и паузы -----------------------------
+  speech_metrics <- reactive({
+    words_df <- rv_words_df(); req(words_df)
+    total_words <- nrow(words_df)
+    total_time <- max(words_df$end, na.rm=TRUE) - min(words_df$start, na.rm=TRUE)
+    if (total_time <= 0) total_time <- 1
+    wpm <- total_words / (total_time / 60)
+    words_df <- words_df %>% arrange(start)
+    pauses <- diff(words_df$start)
+    long_pauses <- pauses[pauses>1]
+    list(WPM=round(wpm,1), AvgPause=if(length(pauses)>0) round(mean(pauses),2) else NA,
+         LongPauses=length(long_pauses), Pauses=pauses)
+  })
+  
+  ###NEW
+  # ----------------------------- Лексические метрики -----------------------------
+  text_complexity_metrics <- reactive({
+    words_df <- rv_words_df(); req(words_df)
+    
+    # 1. Убираем знаки препинания и приводим к нижнему регистру для корректного подсчета
+    # (Это уже делается в обработке слов, но лучше перестраховаться)
+    clean_words <- words_df$word
+    
+    total_words <- nrow(words_df)
+    unique_words <- length(unique(clean_words))
+    
+    # Type-Token Ratio (TTR): (Уникальные слова / Общее число слов) * 100
+    TTR <- if (total_words > 0) round((unique_words / total_words) * 100, 2) else 0
+    
+    # Средняя длина слова
+    # Используем word_raw для точного подсчета длины, включая пробелы/запятые, 
+    # если они были, но лучше использовать очищенное слово
+    mean_word_length <- round(mean(nchar(clean_words)), 2)
+    
+    list(
+      total_words = total_words,
+      unique_words = unique_words,
+      TTR = TTR,
+      mean_word_length = mean_word_length
+    )
+  })
+  ###NEW
+  
+  output$speech_metrics_text <- renderPrint({
+    metrics <- speech_metrics()
+    cat("WPM:", metrics$WPM, "\n")
+    cat("Средняя пауза (сек):", metrics$AvgPause, "\n")
+    cat("Длительные паузы (>1 сек):", metrics$LongPauses, "\n")
+  })
+  
+  
+  # ----------------------------- Sentiment Analysis -----------------------------
+  sentiment_analysis <- reactive({
+    text <- rv_text(); req(text)
+    res <- sentiment_model(text)
+    
+    # Преобразуем результат в R-таблицу
+    df <- data.frame(
+      label = sapply(res, function(x) x$label),
+      score = sapply(res, function(x) x$score)
+    )
+    
+    # Находим строку с максимальным score
+    best_sentiment <- df[which.max(df$score), ]
+    
+    # Возвращаем полный датафрейм (для графиков) и лучший результат
+    list(
+      data = df,
+      best_label = best_sentiment$label,
+      best_score = best_sentiment$score
+    )
+  })
+  
+  output$sentiment_table <- renderTable({ sentiment_analysis()$data })
+  
+  #new
+  output$acoustic_summary_text <- renderPrint({
+    s <- acoustic_summary(); req(s)
+    
+    cat("--- Основные акустические метрики ---\n")
+    cat("Средний Pitch (F0), Гц:", s$mean_f0, "\n")
+    cat("Диапазон Pitch, Гц:", s$range_f0, "\n")
+    cat("Средняя RMS (дБ):", s$mean_rms, "\n")
+    cat("Стандартное отклонение RMS:", s$sd_rms, "\n")
+    
+    cat("\n--- Спектральные характеристики ---\n")
+    cat("Ср. ZCR (шум/звонкость):", s$mean_zcr, "\n")
+    cat("Ср. Centroid (яркость), Гц:", s$mean_centroid, "\n")
+    cat("Ср. Bandwidth (ширина спектра), Гц:", s$mean_bandwidth, "\n")
+    
+    cat("\n--- Ритм и скорость ---\n")
+    cat("Tempo (BPM):", if (is.na(s$mean_tempo)) "Н/Д" else s$mean_tempo, "\n") # <-- Условный вывод
+    
+    if (!is.null(s$ser)) {
+      cat("\nSpeech Emotion Recognition (SER):\n")
+      cat("Эмоция:", s$ser$label, "\n")
+      cat("Вероятности:", paste(round(s$ser$scores,3), collapse=", "), "\n")
+    }
+  })
+  #new
+  #new
+  output$speech_metrics_text <- renderPrint({
+    metrics <- speech_metrics()
+    comp <- text_complexity_metrics()
+    sent <- sentiment_analysis() # <-- Вызываем функцию тональности
+    
+    cat("--- Метрики темпа и пауз ---\n")
+    cat("WPM (слов в минуту):", metrics$WPM, "\n")
+    cat("Средняя пауза (сек):", metrics$AvgPause, "\n")
+    cat("Длительные паузы (>1 сек):", metrics$LongPauses, "\n")
+    
+    cat("\n--- Лексические метрики ---\n")
+    cat("Общее число слов (Tokens):", comp$total_words, "\n")
+    cat("Уникальных слов (Types):", comp$unique_words, "\n")
+    cat("TTR (Разнообразие), %:", comp$TTR, "\n")
+    cat("Ср. длина слова (символов):", comp$mean_word_length, "\n")
+    
+    cat("\n--- Основная тональность ---\n")
+    cat("Эмоция:", sent$best_label, "\n")
+    cat("Уверенность:", round(sent$best_score, 4), "\n") # Выводим метрику
+  })
+  #new
+  
+}
+
+shinyApp(ui, server)
